@@ -8,7 +8,8 @@ fi
 APP_DIR="$INSTALL_DIR/$APP_NAME"
 DATA_DIR="/var/lib/$APP_NAME"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-
+ENV_FILE="$APP_DIR/.env"
+LAST_XRAY_CORES=5
 
 colorized_echo() {
     local color=$1
@@ -61,16 +62,19 @@ detect_and_update_package_manager() {
     if [[ "$OS" == "Ubuntu"* ]] || [[ "$OS" == "Debian"* ]]; then
         PKG_MANAGER="apt-get"
         $PKG_MANAGER update
-        elif [[ "$OS" == "CentOS"* ]]; then
+        elif [[ "$OS" == "CentOS"* ]] || [[ "$OS" == "AlmaLinux"* ]]; then
         PKG_MANAGER="yum"
         $PKG_MANAGER update -y
-        $PKG_MANAGER epel-release -y
+        $PKG_MANAGER install -y epel-release
         elif [ "$OS" == "Fedora"* ]; then
         PKG_MANAGER="dnf"
         $PKG_MANAGER update
         elif [ "$OS" == "Arch" ]; then
         PKG_MANAGER="pacman"
         $PKG_MANAGER -Sy
+        elif [[ "$OS" == "openSUSE"* ]]; then
+        PKG_MANAGER="zypper"
+        $PKG_MANAGER refresh
     else
         colorized_echo red "Unsupported operating system"
         exit 1
@@ -98,7 +102,7 @@ install_package () {
     colorized_echo blue "Installing $PACKAGE"
     if [[ "$OS" == "Ubuntu"* ]] || [[ "$OS" == "Debian"* ]]; then
         $PKG_MANAGER -y install "$PACKAGE"
-        elif [[ "$OS" == "CentOS"* ]]; then
+        elif [[ "$OS" == "CentOS"* ]] || [[ "$OS" == "AlmaLinux"* ]]; then
         $PKG_MANAGER install -y "$PACKAGE"
         elif [ "$OS" == "Fedora"* ]; then
         $PKG_MANAGER install -y "$PACKAGE"
@@ -126,6 +130,7 @@ install_marzban_script() {
 }
 
 install_marzban() {
+    local marzban_version=$1
     # Fetch releases
     FILES_URL_PREFIX="https://raw.githubusercontent.com/Gozargah/Marzban/master"
     
@@ -134,6 +139,14 @@ install_marzban() {
     
     colorized_echo blue "Fetching compose file"
     curl -sL "$FILES_URL_PREFIX/docker-compose.yml" -o "$APP_DIR/docker-compose.yml"
+    docker_file_path="$APP_DIR/docker-compose.yml"
+    # install requested version
+    if [ "$marzban_version" == "latest" ]; then
+        sed -i "s|image: gozargah/marzban:.*|image: gozargah/marzban:latest|g" "$docker_file_path"
+    else
+        sed -i "s|image: gozargah/marzban:.*|image: gozargah/marzban:${marzban_version}|g" "$docker_file_path"
+    fi
+    echo "Installing $marzban_version version"
     colorized_echo green "File saved in $APP_DIR/docker-compose.yml"
     
     colorized_echo blue "Fetching .env file"
@@ -258,8 +271,39 @@ install_command() {
     fi
     detect_compose
     install_marzban_script
-    install_marzban
+    # Function to check if a version exists in the GitHub releases
+    check_version_exists() {
+        local version=$1
+        repo_url="https://api.github.com/repos/Gozargah/Marzban/releases"
+        if [ "$version" == "latest" ] || [ "$version" == "dev" ]; then
+            return 0
+        fi
+        
+        # Fetch the release data from GitHub API
+        response=$(curl -s "$repo_url")
+        
+        # Check if the response contains the version tag
+        if echo "$response" | jq -e ".[] | select(.tag_name == \"${version}\")" > /dev/null; then
+            return 0
+        else
+            return 1
+        fi
+    }
+    # Check if the version is valid and exists
+    if [[ "$1" == "latest" || "$1" == "dev" || "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        if check_version_exists "$1"; then
+            install_marzban "$1"
+            echo "Installing $1 version"
+        else
+            echo "Version $1 does not exist. Please enter a valid version (e.g. v0.5.2)"
+            exit 1
+        fi
+    else
+        echo "Invalid version format. Please enter a valid version (e.g. v0.5.2)"
+        exit 1
+    fi
     up_marzban
+    follow_marzban_logs
 }
 
 uninstall_command() {
@@ -524,19 +568,169 @@ update_command() {
 }
 
 
+identify_the_operating_system_and_architecture() {
+    if [[ "$(uname)" == 'Linux' ]]; then
+        case "$(uname -m)" in
+            'i386' | 'i686')
+                ARCH='32'
+            ;;
+            'amd64' | 'x86_64')
+                ARCH='64'
+            ;;
+            'armv5tel')
+                ARCH='arm32-v5'
+            ;;
+            'armv6l')
+                ARCH='arm32-v6'
+                grep Features /proc/cpuinfo | grep -qw 'vfp' || ARCH='arm32-v5'
+            ;;
+            'armv7' | 'armv7l')
+                ARCH='arm32-v7a'
+                grep Features /proc/cpuinfo | grep -qw 'vfp' || ARCH='arm32-v5'
+            ;;
+            'armv8' | 'aarch64')
+                ARCH='arm64-v8a'
+            ;;
+            'mips')
+                ARCH='mips32'
+            ;;
+            'mipsle')
+                ARCH='mips32le'
+            ;;
+            'mips64')
+                ARCH='mips64'
+                lscpu | grep -q "Little Endian" && ARCH='mips64le'
+            ;;
+            'mips64le')
+                ARCH='mips64le'
+            ;;
+            'ppc64')
+                ARCH='ppc64'
+            ;;
+            'ppc64le')
+                ARCH='ppc64le'
+            ;;
+            'riscv64')
+                ARCH='riscv64'
+            ;;
+            's390x')
+                ARCH='s390x'
+            ;;
+            *)
+                echo "error: The architecture is not supported."
+                exit 1
+            ;;
+        esac
+    else
+        echo "error: This operating system is not supported."
+        exit 1
+    fi
+}
+
+# Function to update the Xray core
+get_xray_core() {
+    identify_the_operating_system_and_architecture
+    # Send a request to GitHub API to get information about the latest four releases
+    latest_releases=$(curl -s "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=$LAST_XRAY_CORES")
+    
+    # Extract versions from the JSON response
+    versions=($(echo "$latest_releases" | grep -oP '"tag_name": "\K(.*?)(?=")'))
+    
+    # Print available versions
+    echo "Available Xray-core versions:"
+    for ((i=0; i<${#versions[@]}; i++)); do
+        echo "$(($i + 1)): ${versions[i]}"
+    done
+    
+    # Prompt the user to choose a version
+    printf "Choose a version to install (1-${#versions[@]}), or press Enter to select the latest by default (${versions[0]}): "
+    read choice
+    
+    # Check if a choice was made by the user
+    if [ -z "$choice" ]; then
+        choice="1"  # Choose the latest version by default
+    fi
+    
+    # Convert the user's choice to an array index
+    choice=$((choice - 1))
+    
+    # Ensure the user's choice is within available versions
+    if [ "$choice" -lt 0 ] || [ "$choice" -ge "${#versions[@]}" ]; then
+        echo "Invalid choice. The latest version (${versions[0]}) is selected by default."
+        choice=$((${#versions[@]} - 1))  # Cho#ose the latest version by default
+    fi
+    
+    # Select the version of Xray-core to install
+    selected_version=${versions[choice]}
+    echo "Selected version $selected_version for installation."
+    
+    # Check if the required packages are installed
+    if ! command -v unzip >/dev/null 2>&1; then
+        echo "Installing unzip..."
+        detect_os
+        install_package unzip
+    fi
+    if ! command -v wget >/dev/null 2>&1; then
+        echo "Installing wget..."
+        detect_os
+        install_package wget
+    fi
+    
+    # Create the /var/lib/marzban/xray-core folder
+    mkdir -p $DATA_DIR/xray-core
+    cd $DATA_DIR/xray-core
+    
+    # Download the selected version of Xray-core
+    xray_filename="Xray-linux-$ARCH.zip"
+    xray_download_url="https://github.com/XTLS/Xray-core/releases/download/${selected_version}/${xray_filename}"
+    
+    echo "Downloading Xray-core version ${selected_version}..."
+    wget -O "${xray_filename}" "${xray_download_url}"
+    
+    # Extract the file from the archive and delete the archive
+    echo "Extracting Xray-core..."
+    unzip -o "${xray_filename}"
+    rm "${xray_filename}"
+}
+
+
+
+# Function to update the Marzban Main core
+update_core_command() {
+    check_running_as_root
+    get_xray_core
+    # Change the Marzban core
+    marzban_folder='$APP_DIR'
+    xray_executable_path="XRAY_EXECUTABLE_PATH=\"/var/lib/marzban/xray-core/xray\""
+    
+    echo "Changing the Marzban core..."
+    # Check if the XRAY_EXECUTABLE_PATH string already exists in the .env file
+    if ! grep -q "^${xray_executable_path}" "$ENV_FILE"; then
+        # If the string does not exist, add it
+        echo "${xray_executable_path}" >> "$ENV_FILE"
+    fi
+    
+    # Restart Marzban
+    colorized_echo red "Restarting Marzban..."
+    $APP_NAME restart -n
+    colorized_echo blue "Installation Xray-core version $selected_version completed."
+}
+
 usage() {
     colorized_echo red "Usage: marzban [command]"
     echo
     echo "Commands:"
-    echo "  up          Start services"
-    echo "  down        Stop services"
-    echo "  restart     Restart services"
-    echo "  status      Show status"
-    echo "  logs        Show logs"
-    echo "  cli         Marzban CLI"
-    echo "  install     Install Marzban"
-    echo "  update      Update latest version"
-    echo "  uninstall   Uninstall Marzban"
+    echo "  up              Start services"
+    echo "  down            Stop services"
+    echo "  restart         Restart services"
+    echo "  status          Show status"
+    echo "  logs            Show logs"
+    echo "  cli             Marzban CLI"
+    echo "  install         Install Marzban"
+    echo "  update          Update latest version"
+    echo "  uninstall       Uninstall Marzban"
+    echo "  install-script  Install Marzban script"
+    echo "  core-update     Update/Change Xray core"
     echo
 }
 
@@ -554,11 +748,15 @@ case "$1" in
     cli)
     shift; cli_command "$@";;
     install)
-    shift; install_command "$@";;
+    shift; install_command "${1:-latest}";;
     update)
     shift; update_command "$@";;
     uninstall)
     shift; uninstall_command "$@";;
+    install-script)
+    shift; install_marzban_script "$@";;
+    core-update)
+    shift; update_core_command "$@";;
     *)
     usage;;
 esac
